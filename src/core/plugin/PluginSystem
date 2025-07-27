@@ -1,0 +1,180 @@
+import { useGlobalStore } from '../../core/state/GlobalStore';
+import { NexusCore } from '../../core/nexus-engine/NexusCore';
+import { generateHash } from '../../lib/utilities/crypto';
+
+interface PluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  icon?: string;
+  requiredPermissions: string[];
+}
+
+interface Plugin {
+  manifest: PluginManifest;
+  initialize: () => void;
+  destroy: () => void;
+  enabled: boolean;
+}
+
+export class PluginSystem {
+  private static instance: PluginSystem;
+  private plugins: Map<string, Plugin> = new Map();
+  private sandboxedIframe: HTMLIFrameElement | null = null;
+
+  private constructor() {
+    this.setupSandbox();
+  }
+
+  public static getInstance(): PluginSystem {
+    if (!PluginSystem.instance) {
+      PluginSystem.instance = new PluginSystem();
+    }
+    return PluginSystem.instance;
+  }
+
+  private setupSandbox(): void {
+    this.sandboxedIframe = document.createElement('iframe');
+    this.sandboxedIframe.style.display = 'none';
+    this.sandboxedIframe.sandbox.add('allow-scripts');
+    document.body.appendChild(this.sandboxedIframe);
+  }
+
+  public async loadPlugin(url: string): Promise<string> {
+    try {
+      const response = await fetch(url);
+      const pluginCode = await response.text();
+      const manifest = this.extractManifest(pluginCode);
+
+      if (!manifest.id) {
+        manifest.id = await generateHash(manifest.name + manifest.version);
+      }
+
+      const plugin: Plugin = {
+        manifest,
+        enabled: false,
+        initialize: () => this.initializePlugin(pluginCode, manifest),
+        destroy: () => this.destroyPlugin(manifest.id)
+      };
+
+      this.plugins.set(manifest.id, plugin);
+      return manifest.id;
+    } catch (error) {
+      console.error('Plugin loading failed:', error);
+      throw new Error('Failed to load plugin');
+    }
+  }
+
+  private extractManifest(code: string): PluginManifest {
+    const manifestMatch = code.match(/\/\*\*[\s]*PLUGIN_MANIFEST:([\s\S]*?)\*\//);
+    if (!manifestMatch) {
+      throw new Error('Plugin manifest not found');
+    }
+
+    try {
+      return JSON.parse(manifestMatch[1].trim());
+    } catch (error) {
+      throw new Error('Invalid plugin manifest format');
+    }
+  }
+
+  private initializePlugin(code: string, manifest: PluginManifest): void {
+    if (!this.sandboxedIframe?.contentWindow) {
+      throw new Error('Sandbox not initialized');
+    }
+
+    try {
+      const pluginAPI = this.createPluginAPI(manifest);
+      const script = `
+        try {
+          ${code}
+          if (typeof initializePlugin === 'function') {
+            initializePlugin(pluginAPI);
+          }
+        } catch (error) {
+          window.parent.postMessage({
+            type: 'plugin-error',
+            pluginId: '${manifest.id}',
+            error: error.message
+          }, '*');
+        }
+      `;
+
+      this.sandboxedIframe.contentWindow.postMessage({
+        type: 'execute-plugin',
+        script,
+        api: pluginAPI
+      }, '*');
+    } catch (error) {
+      console.error(`Plugin initialization failed (${manifest.name}):`, error);
+    }
+  }
+
+  private createPluginAPI(manifest: PluginManifest): any {
+    const permissions = new Set(manifest.requiredPermissions);
+    const api: any = {};
+
+    // Basic API available to all plugins
+    api.showNotification = (title: string, message: string) => {
+      NexusCore.triggerNotification(title, message);
+    };
+
+    // Conditionally add permissions
+    if (permissions.has('read-tasks')) {
+      api.getTasks = () => useGlobalStore.getState().tasks;
+    }
+
+    if (permissions.has('modify-tasks')) {
+      api.addTask = (task: any) => {
+        useGlobalStore.getState().addTask(task);
+      };
+    }
+
+    if (permissions.has('read-finances')) {
+      api.getFinancialData = () => useGlobalStore.getState().finances;
+    }
+
+    return api;
+  }
+
+  private destroyPlugin(pluginId: string): void {
+    this.sandboxedIframe?.contentWindow?.postMessage({
+      type: 'destroy-plugin',
+      pluginId
+    }, '*');
+  }
+
+  public enablePlugin(pluginId: string): boolean {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) return false;
+
+    if (!plugin.enabled) {
+      plugin.initialize();
+      plugin.enabled = true;
+    }
+    return true;
+  }
+
+  public disablePlugin(pluginId: string): boolean {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin || !plugin.enabled) return false;
+
+    plugin.destroy();
+    plugin.enabled = false;
+    return true;
+  }
+
+  public getInstalledPlugins(): PluginManifest[] {
+    return Array.from(this.plugins.values()).map(p => p.manifest);
+  }
+
+  public getActivePlugins(): PluginManifest[] {
+    return Array.from(this.plugins.values())
+      .filter(p => p.enabled)
+      .map(p => p.manifest);
+  }
+}
+
+export const pluginSystem = PluginSystem.getInstance();

@@ -1,0 +1,167 @@
+import { useGlobalStore } from '../../../core/state/GlobalStore';
+import NexusCore from '../../../core/nexus-engine/NexusCore';
+import { generateHash } from '../../../lib/utilities/crypto';
+import { AIIntegration } from '../../../services/ai/AIIntegration';
+
+interface FinancialAnalysis {
+  monthlySummary: {
+    income: number;
+    expenses: number;
+    savings: number;
+  };
+  spendingByCategory: Record<string, number>;
+  budgetHealth: {
+    healthy: number;
+    warning: number;
+    critical: number;
+  };
+  suggestions: string[];
+}
+
+export class FinanceCore {
+  private ai: AIIntegration;
+
+  constructor() {
+    this.ai = new AIIntegration();
+  }
+
+  public async addTransaction(
+    type: 'income' | 'expense',
+    amount: number,
+    category: string,
+    description: string = '',
+    date: Date = new Date()
+  ): Promise<void> {
+    const id = await generateHash(`${Date.now()}-${amount}-${category}`);
+    
+    useGlobalStore.setState(state => ({
+      finances: {
+        ...state.finances,
+        [type === 'income' ? 'income' : 'expenses']: [
+          ...state.finances[type === 'income' ? 'income' : 'expenses'],
+          { id, amount, category, description, date }
+        ]
+      }
+    }));
+
+    // Automatyczne tagowanie
+    if (description) {
+      NexusCore.autoLinkContext(description, id);
+    }
+
+    // Analiza wydatków
+    if (type === 'expense') {
+      this.analyzeSpendingPatterns();
+    }
+  }
+
+  public async createBudget(
+    category: string,
+    limit: number,
+    period: 'daily' | 'weekly' | 'monthly' | 'yearly'
+  ): Promise<void> {
+    const id = await generateHash(`${category}-${period}`);
+    
+    useGlobalStore.setState(state => ({
+      finances: {
+        ...state.finances,
+        budgets: [
+          ...state.finances.budgets,
+          { id, category, limit, period, spent: 0 }
+        ]
+      }
+    }));
+  }
+
+  public async analyzeFinances(): Promise<FinancialAnalysis> {
+    const { finances } = useGlobalStore.getState();
+    const now = new Date();
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+
+    // Podsumowanie miesięczne
+    const monthlyIncome = finances.income
+      .filter(t => new Date(t.date).getMonth() === currentMonth && new Date(t.date).getFullYear() === currentYear)
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    const monthlyExpenses = finances.expenses
+      .filter(t => new Date(t.date).getMonth() === currentMonth && new Date(t.date).getFullYear() === currentYear)
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    // Analiza kategorii
+    const spendingByCategory: Record<string, number> = {};
+    finances.expenses.forEach(t => {
+      spendingByCategory[t.category] = (spendingByCategory[t.category] || 0) + t.amount;
+    });
+
+    // Analiza budżetów
+    const budgetHealth = { healthy: 0, warning: 0, critical: 0 };
+    finances.budgets.forEach(b => {
+      const spent = finances.expenses
+        .filter(t => t.category === b.category)
+        .reduce((sum, t) => sum + t.amount, 0);
+      
+      const percentage = (spent / b.limit) * 100;
+      if (percentage < 70) budgetHealth.healthy++;
+      else if (percentage < 90) budgetHealth.warning++;
+      else budgetHealth.critical++;
+    });
+
+    // Sugestie AI
+    const prompt = `Na podstawie tych danych finansowych: 
+    Przychody: ${monthlyIncome}, Wydatki: ${monthlyExpenses}, 
+    Kategorie: ${JSON.stringify(spendingByCategory)}, 
+    podaj 3 konkretne sugestie optymalizacji w języku polskim.`;
+
+    const aiSuggestions = await this.ai.getAISuggestion(prompt);
+
+    return {
+      monthlySummary: {
+        income: monthlyIncome,
+        expenses: monthlyExpenses,
+        savings: monthlyIncome - monthlyExpenses
+      },
+      spendingByCategory,
+      budgetHealth,
+      suggestions: aiSuggestions.split('\n').filter(s => s.trim())
+    };
+  }
+
+  private async analyzeSpendingPatterns(): Promise<void> {
+    const analysis = await this.analyzeFinances();
+    const { spendingByCategory, monthlySummary } = analysis;
+
+    // Automatyczne tworzenie budżetów dla dużych kategorii
+    Object.entries(spendingByCategory).forEach(([category, amount]) => {
+      if (amount > monthlySummary.income * 0.15) {
+        const hasBudget = useGlobalStore.getState().finances.budgets.some(
+          b => b.category === category
+        );
+        
+        if (!hasBudget) {
+          this.createBudget(category, amount * 1.2, 'monthly');
+        }
+      }
+    });
+
+    // Powiadomienia o dużych wydatkach
+    if (monthlySummary.expenses > monthlySummary.income * 0.8) {
+      NexusCore.triggerNotification(
+        'Ostrzeżenie finansowe',
+        `Twoje wydatki (${monthlySummary.expenses} PLN) stanowią ponad 80% przychodów.`
+      );
+    }
+  }
+
+  public getFinancialHealth(): 'excellent' | 'good' | 'warning' | 'critical' {
+    const { monthlySummary } = this.analyzeFinances();
+    const savingsRate = monthlySummary.savings / monthlySummary.income;
+    
+    if (savingsRate > 0.3) return 'excellent';
+    if (savingsRate > 0.1) return 'good';
+    if (monthlySummary.savings > 0) return 'warning';
+    return 'critical';
+  }
+}
+
+export const financeCore = new FinanceCore();
